@@ -1,0 +1,708 @@
+// Xirevo chat backend: conversations + messages, and the sendMessage action
+// that calls the configured provider through the selected mode persona.
+//
+// History separation: every message records which mode (general/hacking) it
+// belongs to. When building the context sent to the model we only include
+// messages from the current mode, so flipping the toggle mid-conversation
+// never leaks one persona's history into the other's context.
+
+import { getAuthUserId } from "@convex-dev/auth/server";
+import { v } from "convex/values";
+import {
+  action,
+  internalMutation,
+  internalQuery,
+  mutation,
+  query,
+} from "./_generated/server";
+import { api, internal } from "./_generated/api";
+import {
+  MODES,
+  modeValidator,
+  generalModelValidator,
+  DEFAULT_GENERAL_MODEL,
+  type Mode,
+} from "./schema";
+import { normalizeGeneralModel } from "../lib/generalModels";
+import {
+  generateChatCompletion,
+  isRomoniCommand,
+  romoniReplyFor,
+  type ChatContentPart,
+  type ChatMessage,
+} from "./ai";
+
+const HISTORY_LIMIT = 20; // recent messages sent to the model as context
+
+export const listConversations = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return [];
+    const conversations = await ctx.db
+      .query("conversations")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .order("desc")
+      .take(50);
+    // The sidebar only needs to know THAT a chat is locked — never the hash
+    // bytes themselves, which would enable offline PIN guessing.
+    return conversations.map(({ pinHash, pinSalt, ...rest }) => ({
+      ...rest,
+      isLocked: typeof pinHash === "string" && pinHash.length > 0,
+    }));
+  },
+});
+
+export const getConversation = query({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, { conversationId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) return null;
+    // Chat-lock privacy: the pinHash bytes must stay on the server so a stolen
+    // client cache can't be used for offline PIN guessing. The client gets an
+    // isLocked flag instead, plus pinSalt (to hash the PIN locally) and
+    // pinHint (to display on the lock screen).
+    const { pinHash: secret, ...safeConversation } = conversation;
+    return {
+      ...safeConversation,
+      isLocked: typeof secret === "string" && secret.length > 0,
+    };
+  },
+});
+
+/** One-off helper for the General-model popover: returns the readable label
+ *  of the model currently pinned to a conversation (or the site's default).
+ *  Only meaningful for General-mode conversations. */
+export const getConversationGeneralModel = query({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, { conversationId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) return null;
+    if (conversation.mode !== MODES.GENERAL) return null;
+    // Retired picks (e.g. the removed Astra option) read as the default.
+    return normalizeGeneralModel(conversation.generalModel);
+  },
+});
+
+export const getMessages = query({
+  args: {
+    conversationId: v.id("conversations"),
+    pinHash: v.optional(v.string()),
+  },
+  handler: async (ctx, { conversationId, pinHash: callerHash }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) return null;
+    // Chat-lock: a locked conversation only returns its messages when the
+    // caller presents the matching PIN hash. An absent/wrong hash yields an
+    // empty list instead of an error so the UI can render its lock screen.
+    if (conversation.pinHash && conversation.pinHash !== callerHash) {
+      return [];
+    }
+    return ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", conversationId),
+      )
+      .order("asc")
+      .collect();
+  },
+});
+
+/** Returns a one-time URL the client uploads a file to. */
+export const generateUploadUrl = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    return ctx.storage.generateUploadUrl();
+  },
+});
+
+export const createConversation = mutation({
+  args: { mode: modeValidator, generalModel: v.optional(generalModelValidator) },
+  handler: async (ctx, { mode, generalModel }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    return ctx.db.insert("conversations", {
+      userId,
+      title: "New chat",
+      mode,
+      ...(generalModel !== undefined ? { generalModel } : {}),
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+export const touchConversation = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    title: v.optional(v.string()),
+    updatedAt: v.optional(v.number()),
+    generalModel: v.optional(generalModelValidator),
+  },
+  handler: async (ctx, { conversationId, title, updatedAt, generalModel }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    await ctx.db.patch(conversationId, {
+      ...(title !== undefined ? { title } : {}),
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+      ...(generalModel !== undefined ? { generalModel } : {}),
+    });
+  },
+});
+
+export const insertMessage = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    role: v.union(v.literal("user"), v.literal("assistant")),
+    content: v.string(),
+    mode: modeValidator,
+    attachments: v.optional(
+      v.array(
+        v.object({
+          storageId: v.string(),
+          name: v.string(),
+          type: v.string(),
+          size: v.number(),
+          url: v.string(),
+        }),
+      ),
+    ),
+  },
+  handler: async (ctx, { conversationId, role, content, mode, attachments }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    return ctx.db.insert("messages", {
+      conversationId,
+      role,
+      content,
+      mode,
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+      createdAt: Date.now(),
+    });
+  },
+});
+
+/** Patch a single message's content — used by sendMessage to stream the
+ *  assistant reply into the database progressively so the reactive
+ *  getMessages query shows text appearing in real time. Ownership-checked. */
+export const updateMessageContent = mutation({
+  args: {
+    messageId: v.id("messages"),
+    content: v.string(),
+    model: v.optional(v.string()),
+  },
+  handler: async (ctx, { messageId, content, model }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const message = await ctx.db.get(messageId);
+    if (!message) throw new Error("Message not found");
+    const conversation = await ctx.db.get(message.conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    await ctx.db.patch(messageId, {
+      content,
+      ...(model !== undefined ? { model } : {}),
+    });
+  },
+});
+
+/** One-off repair for legacy data: conversations are locked to the mode they
+ *  were created in (the first message's mode). The old mode-toggle used to
+ *  re-label conversations, so some existing rows disagree with their own
+ *  messages. This syncs every conversation back to its first message's mode.
+ *  Idempotent — safe to re-run. */
+export const repairConversationModes = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const conversations = await ctx.db.query("conversations").collect();
+    let fixed = 0;
+    for (const conversation of conversations) {
+      const messages = await ctx.db
+        .query("messages")
+        .withIndex("by_conversation", (q) =>
+          q.eq("conversationId", conversation._id),
+        )
+        .order("asc")
+        .collect();
+      const firstMode = messages[0]?.mode;
+      if (firstMode && firstMode !== conversation.mode) {
+        await ctx.db.patch(conversation._id, { mode: firstMode });
+        fixed += 1;
+      }
+    }
+    return { fixed };
+  },
+});
+
+// ---------- Chat lock (PIN protection) ----------
+// A locked conversation hides its messages behind a PIN. The raw PIN never
+// reaches the server: the client hashes sha256(salt + ":" + pin) and the
+// server only ever stores/compares that hash (same code as src/lib/pinHash.ts).
+// Withdrawing a lock requires the current PIN so anyone who picked up the
+// phone can't just unlock it.
+
+/** Lock (or re-lock) a conversation. The client hashes the PIN locally
+ *  (sha256(salt + ":" + pin), see src/lib/pinHash.ts) so the raw PIN never
+ *  leaves the device — the server only ever stores the salt + hash. */
+export const setConversationLock = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    salt: v.string(),
+    hash: v.string(),
+    hint: v.optional(v.string()),
+  },
+  handler: async (ctx, { conversationId, salt, hash, hint }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    if (salt.length < 16 || hash.length < 32) {
+      throw new Error("Invalid lock payload");
+    }
+    await ctx.db.patch(conversationId, {
+      pinSalt: salt,
+      pinHash: hash,
+      pinHint: hint?.trim() ? hint.trim() : undefined,
+    });
+  },
+});
+
+/** Verify a lock hash for a locked conversation without changing anything. */
+export const verifyConversationLock = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    hash: v.string(),
+  },
+  handler: async (ctx, { conversationId, hash }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    return verifyLock(conversation, hash);
+  },
+});
+
+/** Remove a conversation's lock — requires the current PIN's hash. */
+export const removeConversationLock = mutation({
+  args: {
+    conversationId: v.id("conversations"),
+    hash: v.string(),
+  },
+  handler: async (ctx, { conversationId, hash }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    if (!verifyLock(conversation, hash)) {
+      throw new Error("Incorrect PIN");
+    }
+    await ctx.db.patch(conversationId, {
+      pinSalt: undefined,
+      pinHash: undefined,
+      pinHint: undefined,
+    });
+  },
+});
+
+/** Internal: verify a PIN against a conversation's lock (used by actions,
+ *  which can't touch ctx.db directly). Returns true when unlocked. */
+export const verifyLockInternal = internalQuery({
+  args: {
+    conversationId: v.id("conversations"),
+    hash: v.string(),
+  },
+  handler: async (ctx, { conversationId, hash }) => {
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation) return true;
+    return verifyLock(conversation, hash);
+  },
+});
+
+/** True if this conversation is PIN-locked and the PIN matches (or the
+ *  conversation isn't locked). Throws on wrong PIN for locked conversations. */
+function verifyLock(
+  conversation: { pinSalt?: string; pinHash?: string },
+  hash: string,
+): boolean {
+  const { pinSalt, pinHash: storedHash } = conversation;
+  if (!pinSalt || !storedHash) return true; // not locked
+  return hash === storedHash;
+}
+
+export const deleteConversation = mutation({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, { conversationId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversation = await ctx.db.get(conversationId);
+    if (!conversation || conversation.userId !== userId) {
+      throw new Error("Conversation not found");
+    }
+    const messages = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", conversationId),
+      )
+      .collect();
+    for (const message of messages) {
+      await ctx.db.delete(message._id);
+    }
+    await ctx.db.delete(conversationId);
+  },
+});
+
+/** Guest mode: permanently delete every conversation and message owned by the
+ *  current user. Anonymous guest sessions use this so their chats never
+ *  survive — it runs when a guest starts a fresh session and when they leave. */
+export const purgeGuestData = mutation({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const conversations = await ctx.db
+      .query("conversations")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .collect();
+    for (const conversation of conversations) {
+      const messages = await ctx.db
+        .query("messages")
+        .withIndex("by_conversation", (q) =>
+          q.eq("conversationId", conversation._id),
+        )
+        .collect();
+      for (const message of messages) {
+        await ctx.db.delete(message._id);
+      }
+      await ctx.db.delete(conversation._id);
+    }
+    return { deleted: conversations.length };
+  },
+});
+
+/** Internal sweep run by the hourly cron: remove abandoned guest data —
+ *  conversations belonging to anonymous users that haven't been touched in
+ *  24h. Covers guests who close the browser without signing out, so nothing
+ *  they typed can linger on the server. */
+export const cleanupGuestData = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const users = await ctx.db.query("users").collect();
+    const anonymousIds = new Set(
+      users.filter((user) => user.isAnonymous === true).map((user) => user._id),
+    );
+    if (anonymousIds.size === 0) return { deleted: 0 };
+    let deleted = 0;
+    for (const userId of anonymousIds) {
+      const conversations = await ctx.db
+        .query("conversations")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .filter((q) => q.lt(q.field("updatedAt"), cutoff))
+        .collect();
+      for (const conversation of conversations) {
+        const messages = await ctx.db
+          .query("messages")
+          .withIndex("by_conversation", (q) =>
+            q.eq("conversationId", conversation._id),
+          )
+          .collect();
+        for (const message of messages) {
+          await ctx.db.delete(message._id);
+        }
+        await ctx.db.delete(conversation._id);
+        deleted += 1;
+      }
+    }
+    return { deleted };
+  },
+});
+
+/** Friendly in-chat notice shown when the provider key(s) are not configured. */
+const SETUP_NOTICE = `Heads up — I can't reach my brain right now. The app is missing an **AI API key**.
+
+- **General mode** needs a **Gemini API key** (\`GEMINI_API_KEY\`). For extra
+  speed and reliability, add more keys in \`GEMINI_API_KEYS\` (comma-separated)
+  or \`GEMINI_API_KEY_2\`, \`GEMINI_API_KEY_3\`… — they're rotated automatically.
+- **Hacking mode** needs a **Groq API key** (\`GROQ_API_KEY\`, or several comma-separated in \`GROQ_API_KEYS\`).
+
+Add them in your project's **Keys/API keys** settings, and I'll be ready to answer anything in both modes.`;
+
+/** Build OpenAI-style content for a stored user message: plain text plus image
+ *  attachments as image_url parts (only images; other files are just named). */
+function contentPartsFor(
+  content: string,
+  attachments?: { url: string; type: string; name: string }[],
+): string | ChatContentPart[] {
+  const images = (attachments ?? []).filter((a) =>
+    a.type.startsWith("image/"),
+  );
+  if (images.length === 0) return content;
+  const parts: ChatContentPart[] = [];
+  if (content.trim()) parts.push({ type: "text", text: content });
+  for (const image of images) {
+    parts.push({ type: "image_url", image_url: { url: image.url } });
+  }
+  return parts;
+}
+
+export const sendMessage = action({
+  args: {
+    conversationId: v.optional(v.id("conversations")),
+    mode: modeValidator,
+    content: v.string(),
+    fast: v.optional(v.boolean()),
+    // General-mode model picker: when set (only meaningful in General mode),
+    // this conversation uses that Gemini model instead of the site default.
+    // The backend's fallback chain still protects against retired models.
+    generalModel: v.optional(generalModelValidator),
+    // Chat-lock: required when the target conversation is PIN-locked.
+    pinHash: v.optional(v.string()),
+    attachments: v.optional(
+      v.array(
+        v.object({
+          storageId: v.string(),
+          name: v.string(),
+          type: v.string(),
+          size: v.number(),
+        }),
+      ),
+    ),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ conversationId: string }> => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+
+    const content = args.content.trim();
+    if (!content && (args.attachments ?? []).length === 0) {
+      throw new Error("Message cannot be empty");
+    }
+
+    // The \romoni command is answered locally with a crafted reply — no
+    // provider call, so it's instant and works even without API keys.
+    const romoniCommand = isRomoniCommand(content);
+
+    // Resolve the conversation: use the caller's id if it still exists and
+    // belongs to them; otherwise self-heal by starting a fresh conversation.
+    // A stale id happens in practice when a guest's data is purged (fresh
+    // guest sessions start empty) while the UI always holds the old id — the
+    // old code failed the whole send with "Conversation not found". The
+    // returned conversationId is what the caller should select afterwards.
+    let conversationId = args.conversationId;
+    let conversation: { title: string; mode: Mode } | null = null;
+    if (conversationId !== undefined) {
+      conversation = await ctx.runQuery(api.chat.getConversation, {
+        conversationId,
+      });
+    }
+    if (conversation === null) {
+      conversationId = await ctx.runMutation(api.chat.createConversation, {
+        mode: args.mode,
+      });
+      conversation = { title: "New chat", mode: args.mode };
+    }
+    // Both branches above guarantee an id; this narrows it for the rest of
+    // the function (unreachable in practice).
+    if (conversationId === undefined) {
+      throw new Error("Conversation not found");
+    }
+
+    // Chat-lock enforcement: sending into a locked conversation requires the
+    // correct PIN (hashed on the client; see src/lib/pinHash.ts).
+    const unlocked = await ctx.runQuery(internal.chat.verifyLockInternal, {
+      conversationId,
+      hash: args.pinHash ?? "",
+    });
+    if (!unlocked) {
+      throw new Error("Incorrect PIN");
+    }
+
+    // The getMessages call below uses the same hash so a locked conversation
+    // still returns its history — otherwise the model would see an empty
+    // context and answer every follow-up as if the chat were brand new.
+
+    // Resolve attachment storage ids to public URLs.
+    const attachments = await Promise.all(
+      (args.attachments ?? []).map(async (attachment) => {
+        const url = await ctx.storage.getUrl(attachment.storageId);
+        if (!url) return null;
+        return { ...attachment, url };
+      }),
+    );
+    const resolvedAttachments = attachments.filter(
+      (a): a is NonNullable<typeof a> => a !== null,
+    );
+
+    // Persist the user message right away so it appears instantly.
+    await ctx.runMutation(api.chat.insertMessage, {
+      conversationId,
+      role: "user",
+      content,
+      mode: args.mode,
+      ...(resolvedAttachments.length > 0
+        ? { attachments: resolvedAttachments }
+        : {}),
+    });
+
+    // Auto-title the conversation from the first message, and persist any
+    // General-model change the user made in the header popover.
+    const title =
+      romoniCommand
+        ? args.mode === MODES.HACKING
+          ? "Love Protocol — Romoni"
+          : "Love letter — Romoni"
+        : conversation.title === "New chat"
+          ? content.length > 48
+            ? `${content.slice(0, 48)}…`
+            : content
+          : conversation.title;
+    await ctx.runMutation(api.chat.touchConversation, {
+      conversationId,
+      title,
+      updatedAt: Date.now(),
+      ...(args.generalModel !== undefined && args.mode === MODES.GENERAL
+        ? { generalModel: args.generalModel }
+        : {}),
+    });
+
+    // Build recent history for context (oldest -> newest), filtered to the
+    // current mode so hacking and general history never mix in the model's
+    // context.
+    const allMessages = await ctx.runQuery(api.chat.getMessages, {
+      conversationId,
+      pinHash: args.pinHash,
+    });
+    const history: ChatMessage[] = (allMessages ?? [])
+      // Legacy rows (pre-mode) are included; everything else must match the
+      // current mode so hacking and general history stay separate.
+      .filter(
+        (message) => message.mode === undefined || message.mode === args.mode,
+      )
+      .slice(-HISTORY_LIMIT)
+      .map((message) => ({
+        role: message.role as "user" | "assistant",
+        content:
+          message.role === "user"
+            ? contentPartsFor(message.content, message.attachments)
+            : message.content,
+      }));
+
+    // The \romoni command is answered locally and instantly — no streaming.
+    if (romoniCommand) {
+      await ctx.runMutation(api.chat.insertMessage, {
+        conversationId,
+        role: "assistant",
+        content: romoniReplyFor(args.mode),
+        mode: args.mode,
+      });
+      return { conversationId };
+    }
+
+    // Stream the AI reply into the chat: insert an empty assistant message
+    // first, then progressively write the provider's tokens into it. The
+    // reactive getMessages query picks up each patch, so the reply appears to
+    // type itself instead of the UI staying frozen until the whole answer is
+    // ready (the reason General mode felt so slow).
+    const assistantMessageId = await ctx.runMutation(api.chat.insertMessage, {
+      conversationId,
+      role: "assistant",
+      content: "",
+      mode: args.mode,
+    });
+
+    // Throttled persistence: write at most once every ~200ms (or sooner if a
+    // big chunk lands). Intermediate writes are fire-and-forget so DB latency
+    // never throttles the stream itself (the old `await` made every chunk wait
+    // on a full mutation round-trip — that alone stretched answers by seconds).
+    // The final forced write is awaited so the exact stored text is guaranteed
+    // before the action returns, even if the stream died partway.
+    let flushedLength = 0;
+    let lastFlushAt = 0;
+    let inFlight = 0;
+    const flush = (text: string, force = false, model?: string): Promise<void> => {
+      const now = Date.now();
+      if (
+        !force &&
+        now - lastFlushAt < 200 &&
+        text.length - flushedLength < 150
+      ) {
+        return Promise.resolve();
+      }
+      lastFlushAt = now;
+      flushedLength = text.length;
+      const write = ctx
+        .runMutation(api.chat.updateMessageContent, {
+          messageId: assistantMessageId,
+          content: text,
+          ...(model !== undefined ? { model } : {}),
+        })
+        .then(
+          () => undefined,
+          () => undefined,
+        );
+      if (force) return write;
+      inFlight += 1;
+      write.then(() => {
+        inFlight -= 1;
+      });
+      // If writes pile up (slow DB), yield briefly so we don't queue
+      // unboundedly — then keep streaming.
+      if (inFlight > 3) {
+        return new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return Promise.resolve();
+    };
+
+    const result = await generateChatCompletion(
+      args.mode,
+      history,
+      flush,
+      {
+        fast: args.fast === true,
+        // When the user picked a specific Gemini model for this conversation,
+        // try it first — the generator's fallback chain still protects against
+        // retired models, so this is a preference not a hard constraint.
+        ...(args.mode === MODES.GENERAL && args.generalModel
+          ? { model: args.generalModel }
+          : {}),
+      },
+    );
+    // Always land the final text (or an error message) in the database, even
+    // if the stream died partway through.
+    await flush(
+      result.ok
+        ? result.content
+        : result.error === "missing-key"
+          ? SETUP_NOTICE
+          : "I hit a snag while thinking. Please try again in a moment.",
+      true,
+      result.ok ? result.model : undefined,
+    );
+
+    return { conversationId };
+  },
+});
