@@ -183,3 +183,288 @@
     0 1px 0 0 oklch(1 0 0 / 6%) inset,
     0 20px 50px -24px oklch(0 0 0 / 0.6);
 }
+
+/* ============================================================
+   Landing motion layer
+   Ambient aurora, marquee, pointer spotlight, shimmer, floats.
+   Everything here is decorative and respects reduced-motion.
+   ============================================================ */
+
+/* ---- Ambient aurora field ---- */
+.tm-aurora {
+  position: absolute;
+  border-radius: 999px;
+  filter: blur(72px);
+  opacity: 0.5;
+  will-change: transform;
+}
+
+.tm-aurora-a {
+  width: 44rem;
+  height: 32rem;
+  left: -12rem;
+  top: -12rem;
+  background: radial-gradient(
+    circle at 45% 45%,
+    rgba(52, 211, 153, 0.55),
+    transparent 68%
+  );
+  animation: tm-drift-a 24s ease-in-out infinite;
+}
+
+.tm-aurora-b {
+  width: 40rem;
+  height: 30rem;
+  right: -10rem;
+  top: -8rem;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(56, 189, 248, 0.45),
+    transparent 68%
+  );
+  animation: tm-drift-b 28s ease-in-out infinite;
+}
+
+.tm-aurora-c {
+  width: 34rem;
+  height: 26rem;
+  left: 32%;
+  top: 6rem;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(74, 222, 128, 0.32),
+    transparent 70%
+  );
+  animation: tm-drift-c 32s ease-in-out infinite;
+}
+
+.tm-grid {
+  position: absolute;
+  inset: -1px;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.055) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(62% 55% at 50% 0%, #000 22%, transparent 76%);
+  -webkit-mask-image: radial-gradient(
+    62% 55% at 50% 0%,
+    #000 22%,
+    transparent 76%
+  );
+  animation: tm-grid-pan 30s linear infinite;
+}
+
+.tm-grain {
+  position: absolute;
+  inset: 0;
+  opacity: 0.04;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/></filter><rect width='140' height='140' filter='url(%23n)'/></svg>");
+}
+
+/* ---- Infinite marquee ---- */
+.tm-marquee {
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 12%,
+    #000 88%,
+    transparent
+  );
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 12%,
+    #000 88%,
+    transparent
+  );
+}
+
+.tm-marquee-track {
+  display: flex;
+  width: max-content;
+  animation: tm-marquee var(--tm-duration, 38s) linear infinite;
+}
+
+.tm-marquee:hover .tm-marquee-track {
+  animation-play-state: paused;
+}
+
+.tm-marquee-reverse .tm-marquee-track {
+  animation-direction: reverse;
+}
+
+/* ---- Pointer spotlight on cards ---- */
+@property --tm-spot {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: rgba(255, 255, 255, 0);
+}
+
+.tm-spotlight {
+  --tm-spot: rgba(255, 255, 255, 0);
+  background-image: radial-gradient(
+    260px circle at var(--mx, 50%) var(--my, 0%),
+    var(--tm-spot),
+    transparent 66%
+  );
+  transition: --tm-spot 0.45s ease;
+}
+
+.tm-spotlight:hover {
+  --tm-spot: rgba(255, 255, 255, 0.075);
+}
+
+/* ---- Shimmer sweep (buttons / pills) ---- */
+.tm-shine {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.tm-shine::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    110deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.55) 50%,
+    transparent 70%
+  );
+  transform: translateX(-130%);
+  transition: transform 0.75s ease;
+}
+
+.tm-shine:hover::after {
+  transform: translateX(130%);
+}
+
+/* ---- Looping gradient type ---- */
+.tm-gradient-pan {
+  background-size: 220% 100%;
+  animation: tm-pan 9s ease-in-out infinite;
+}
+
+/* ---- Ambient loops ---- */
+.tm-float {
+  animation: tm-float 7s ease-in-out infinite;
+}
+
+.tm-float-slow {
+  animation: tm-float 10s ease-in-out infinite;
+}
+
+.tm-spin-slow {
+  animation: tm-spin 18s linear infinite;
+}
+
+/* ---- Nav link underline ---- */
+.tm-nav-link {
+  position: relative;
+}
+
+.tm-nav-link::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -6px;
+  height: 1.5px;
+  border-radius: 999px;
+  background: linear-gradient(to right, #34d399, #38bdf8);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.tm-nav-link:hover::after {
+  transform: scaleX(1);
+}
+
+@keyframes tm-drift-a {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(4rem, 2.5rem, 0) scale(1.12);
+  }
+}
+
+@keyframes tm-drift-b {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1.05);
+  }
+  50% {
+    transform: translate3d(-3.5rem, 3rem, 0) scale(0.92);
+  }
+}
+
+@keyframes tm-drift-c {
+  0%,
+  100% {
+    transform: translate3d(-2rem, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(3rem, -2rem, 0) scale(1.18);
+  }
+}
+
+@keyframes tm-grid-pan {
+  to {
+    background-position:
+      64px 64px,
+      64px 64px;
+  }
+}
+
+@keyframes tm-marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes tm-pan {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@keyframes tm-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-12px);
+  }
+}
+
+@keyframes tm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tm-aurora,
+  .tm-grid,
+  .tm-marquee-track,
+  .tm-gradient-pan,
+  .tm-float,
+  .tm-float-slow,
+  .tm-spin-slow {
+    animation: none !important;
+  }
+
+  .tm-shine::after {
+    display: none;
+  }
+}

@@ -25,6 +25,12 @@ import {
 } from "./schema";
 import { normalizeGeneralModel } from "../lib/generalModels";
 import {
+  fetchLinkContext,
+  fetchVideoContext,
+  readableLinkUrls,
+  youtubeVideoUrls,
+} from "./links";
+import {
   generateChatCompletion,
   isRomoniCommand,
   romoniReplyFor,
@@ -449,6 +455,50 @@ const SETUP_NOTICE = `Heads up — I can't reach my brain right now. The app is 
 
 Add them in your project's **Keys/API keys** settings, and I'll be ready to answer anything in both modes.`;
 
+/** Video links from earlier turns, re-attached when a follow-up asks about
+ *  "this video". The video itself is not re-sent (that would reprocess it on
+ *  every message), but its exact title/channel are — otherwise the model has
+ *  no idea what to call it and invents a title. */
+function followUpVideoUrls(
+  content: string,
+  history: ChatMessage[],
+): string[] {
+  const refersToVideo =
+    /\b(video|title|tittle|channel|clip|uploader|thumbnail|duration|timestamp)\b/i.test(
+      content,
+    );
+  if (!refersToVideo) return [];
+  for (let index = history.length - 1; index >= 0; index--) {
+    const message = history[index];
+    if (message.role !== "user") continue;
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .filter((part) => part.type === "text")
+            .map((part) => (part as { text: string }).text)
+            .join("\n");
+    const urls = youtubeVideoUrls(text);
+    if (urls.length > 0) return urls;
+  }
+  return [];
+}
+
+/** Append fetched link content to the newest user turn, so the model reads it as
+ *  part of the message that referenced the link. */
+function withLinkContext(
+  history: ChatMessage[],
+  context: string,
+): ChatMessage[] {
+  if (!context.trim() || history.length === 0) return history;
+  const last = history[history.length - 1];
+  const content =
+    typeof last.content === "string"
+      ? `${last.content}\n\n${context}`
+      : [...last.content, { type: "text" as const, text: context }];
+  return [...history.slice(0, -1), { ...last, content }];
+}
+
 /** Build OpenAI-style content for a stored user message: plain text plus image
  *  attachments as image_url parts (only images; other files are just named). */
 function contentPartsFor(
@@ -622,6 +672,25 @@ export const sendMessage = action({
       return { conversationId };
     }
 
+    // Link understanding: read the pages the user pasted so the model answers
+    // about their real content, pull out YouTube links for Gemini's native
+    // video path, and attach YouTube's own title/channel metadata — a video
+    // part carries the pixels but not the title, so without this the model
+    // guesses at it. All best-effort: a dead link just adds nothing.
+    const videoUrls = youtubeVideoUrls(content);
+    const contextVideoUrls =
+      videoUrls.length > 0 ? videoUrls : followUpVideoUrls(content, history);
+    const [linkContext, videoContext] = await Promise.all([
+      fetchLinkContext(readableLinkUrls(content)),
+      fetchVideoContext(contextVideoUrls),
+    ]);
+    const modelHistory = withLinkContext(
+      history,
+      [videoContext, linkContext]
+        .filter((block) => block.trim() !== "")
+        .join("\n\n"),
+    );
+
     // Stream the AI reply into the chat: insert an empty assistant message
     // first, then progressively write the provider's tokens into it. The
     // reactive getMessages query picks up each patch, so the reply appears to
@@ -679,10 +748,11 @@ export const sendMessage = action({
 
     const result = await generateChatCompletion(
       args.mode,
-      history,
+      modelHistory,
       flush,
       {
         fast: args.fast === true,
+        ...(videoUrls.length > 0 ? { videoUrls } : {}),
         // When the user picked a specific Gemini model for this conversation,
         // try it first — the generator's fallback chain still protects against
         // retired models, so this is a preference not a hard constraint.

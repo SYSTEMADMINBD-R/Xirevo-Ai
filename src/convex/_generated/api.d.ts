@@ -14,6 +14,7 @@ import type * as auth_emailOtp from "../auth/emailOtp.js";
 import type * as chat from "../chat.js";
 import type * as crons from "../crons.js";
 import type * as http from "../http.js";
+import type * as links from "../links.js";
 import type * as users from "../users.js";
 
 import type {
@@ -29,6 +30,7 @@ declare const fullApi: ApiFromModules<{
   chat: typeof chat;
   crons: typeof crons;
   http: typeof http;
+  links: typeof links;
   users: typeof users;
 }>;
 
